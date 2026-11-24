@@ -1,0 +1,940 @@
+import secrets
+import uuid
+from datetime import datetime, timedelta, timezone
+
+from django.conf import settings
+from django.http import HttpResponse
+from django.shortcuts import render
+from rest_framework.decorators import (
+    api_view,
+    authentication_classes,
+    permission_classes,
+)
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+
+from . import (
+    addresses, audit, db, eta, geocoding, idempotency, keys, lifecycle, livefeed,
+    pricing, progress, proof, ratelimit, reports, scheduling, statements, wallet, webhooks,
+)
+
+# How far from pickup toward drop-off the driver should appear at each stage.
+STAGE_PROGRESS = {"accepted": 0.0, "arrived": 0.05, "picked_up": 0.1, "in_transit": 0.6,
+                  "arrived_dropoff": 0.95, "delivered": 1.0}
+from .authentication import ApiKeyAuthentication, require_scope
+from .errors import error_response
+
+STARTING_WALLET_CENTS = 10000  # new businesses get $100.00 of test funds
+
+_KEY_NS = uuid.UUID("a1b2c3d4-0000-4000-8000-000000000000")
+
+_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no ambiguous chars
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _delivery_code():
+    return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(6))
+
+
+def _in_service_area(point):
+    for area in settings.SERVICE_AREAS:
+        if not area.get("active"):
+            continue
+        d = pricing.haversine_km(point, {"lat": area["lat"], "lng": area["lng"]})
+        if d <= area["radius_km"]:
+            return True
+    return False
+
+
+def _valid_point(obj):
+    try:
+        float(obj["lat"]), float(obj["lng"])
+        return True
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _rate_limited(request):
+    """Enforce the per-key request budget. Returns a 429 Response if over budget,
+    else None. The limiter is keyed by the authenticating key's prefix."""
+    record = getattr(request, "api_key", None)
+    key = (record or {}).get("key_prefix") or str(request.user.business_owner_id)
+    decision = ratelimit.enforce(key)
+    if decision["allowed"]:
+        return None
+    resp = error_response("rate_limited", "Too many requests — please slow down.", 429,
+                          {"retry_after_seconds": decision["retry_after"]})
+    for header, value in ratelimit.headers(decision).items():
+        resp[header] = value
+    return resp
+
+
+# --------------------------------------------------------------------------- #
+# health (no auth)
+# --------------------------------------------------------------------------- #
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def health(request):
+    result = {"status": "ok", "service": "aerrand-developer-api", "version": "v1"}
+    try:
+        import pymongo
+
+        pymongo.MongoClient(settings.MONGO_URL, serverSelectionTimeoutMS=1500).admin.command("ping")
+        result["mongodb"] = "connected"
+    except Exception as exc:  # noqa: BLE001
+        result["mongodb"] = f"unavailable ({exc.__class__.__name__})"
+    try:
+        import redis
+
+        redis.from_url(settings.REDIS_URL, socket_connect_timeout=1.5).ping()
+        result["redis"] = "connected"
+    except Exception as exc:  # noqa: BLE001
+        result["redis"] = f"unavailable ({exc.__class__.__name__})"
+    return Response(result)
+
+
+# --------------------------------------------------------------------------- #
+# GET /v1/service-areas
+# --------------------------------------------------------------------------- #
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def service_areas(request):
+    areas = [
+        {"slug": a["slug"], "name": a["name"], "province": a["province"],
+         "lat": a["lat"], "lng": a["lng"], "radiusKm": a["radius_km"], "active": a["active"]}
+        for a in settings.SERVICE_AREAS
+    ]
+    return Response({"serviceAreas": areas, "updatedAt": _now().isoformat()})
+
+
+# --------------------------------------------------------------------------- #
+# POST /v1/quotes  — route quote
+# --------------------------------------------------------------------------- #
+@api_view(["POST"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def geocode_address(request):
+    """Turn a typed address/place into coordinates (used by the portal's location fields)."""
+    require_scope(request, "read")
+    result = geocoding.geocode((request.data or {}).get("query", ""))
+    if not result:
+        return error_response("address_not_found",
+                              "Couldn't find that address near Windsor. Try a place like "
+                              "\"University of Windsor\" or a Windsor street address.", 422)
+    return Response(result)
+
+
+@api_view(["POST"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def quotes(request):
+    require_scope(request, "read")
+    limited = _rate_limited(request)
+    if limited:
+        return limited
+    body = request.data or {}
+
+    pickup = body.get("pickup")
+    stops = body.get("stops")
+    # allow a single drop-off phrased as dropoff
+    if stops is None and body.get("dropoff") is not None:
+        stops = [body["dropoff"]]
+
+    details = {}
+    if not isinstance(pickup, dict) or not _valid_point(pickup):
+        details["pickup"] = "pickup with numeric lat/lng is required"
+    if not isinstance(stops, list) or not (1 <= len(stops) <= 5):
+        details["stops"] = "1 to 5 stops are required"
+    if details:
+        return error_response("validation_failed", "Invalid request.", 400, details)
+
+    for i, s in enumerate(stops):
+        if not _valid_point(s):
+            return error_response("validation_failed", "Invalid request.", 400,
+                                  {f"stops[{i}]": "numeric lat/lng required"})
+
+    # service-area check
+    outside = []
+    for i, p in enumerate([pickup, *stops]):
+        if not _in_service_area(p):
+            outside.append(i)
+    if outside:
+        return error_response(
+            "service_area_unavailable",
+            "A pickup or drop-off is outside a served city.",
+            412,
+            {"outside_indexes": outside},
+        )
+
+    breakdown = pricing.price_route(pickup, stops)
+    if breakdown["overVanCapacity"]:
+        return error_response("route_over_capacity",
+                              "Route exceeds one cargo van; split the booking.", 400)
+
+    quote_id = "qt_" + uuid.uuid4().hex[:22]
+    expires_at = _now() + timedelta(seconds=settings.API_QUOTE_TTL_SECONDS)
+    db.quotes().insert_one({
+        "quote_id": quote_id,
+        "business_owner_id": request.user.business_owner_id,
+        "environment": request.api_key["environment"],
+        "pickup": pickup,
+        "stops": stops,
+        "breakdown": breakdown,
+        "expires_at": expires_at,
+        "created_at": _now(),
+    })
+
+    return Response({"quote_id": quote_id, "expires_at": expires_at.isoformat(), **breakdown})
+
+
+# --------------------------------------------------------------------------- #
+# POST /v1/errands  — create a (test-mode) delivery, priced from the quote
+# --------------------------------------------------------------------------- #
+@api_view(["GET", "POST"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def errands_collection(request):
+    """GET lists the business's errands; POST creates one."""
+    if request.method == "GET":
+        return _list_errands(request)
+    return _create_errand(request)
+
+
+def _create_errand(request):
+    require_scope(request, "create")
+    limited = _rate_limited(request)
+    if limited:
+        return limited
+    body = request.data or {}
+    owner = request.user.business_owner_id
+    environment = request.api_key["environment"]
+
+    # idempotency: a retried request with the same key must not create a second delivery
+    idem_key = request.META.get("HTTP_IDEMPOTENCY_KEY")
+    idem_fp = idempotency.fingerprint(body) if idem_key else None
+    if idem_key:
+        existing = idempotency.lookup(owner, idem_key)
+        if existing:
+            if existing["fingerprint"] == idem_fp:
+                return Response(existing["response"], status=201,
+                                headers={"Idempotent-Replayed": "true"})
+            return error_response("idempotency_key_reused",
+                                  "This Idempotency-Key was already used with a different request.", 422)
+
+    quote_id = body.get("quote_id")
+    if not quote_id:
+        return error_response("validation_failed", "Invalid request.", 400,
+                              {"quote_id": "quote_id is required (price is server-computed)"})
+
+    quote = db.quotes().find_one({"quote_id": quote_id, "business_owner_id": owner})
+    if not quote:
+        return error_response("errand_not_found", "Quote not found.", 404)
+    exp = quote["expires_at"]
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp < _now():
+        return error_response("quote_expired", "Quote has expired; request a new one.", 409)
+
+    # scheduled deliveries (Sujith's module): validate the requested time window
+    ok, sched_err = scheduling.validate_scheduled_at(body.get("scheduled_at"))
+    if not ok:
+        return error_response("validation_failed", "Invalid request.", 400,
+                              {"scheduled_at": sched_err})
+
+    # drop-offs: dropoffs[] (multi) or dropoff (single)
+    dropoffs = body.get("dropoffs")
+    if dropoffs is None and body.get("dropoff") is not None:
+        dropoffs = [body["dropoff"]]
+    if not isinstance(dropoffs, list) or not (1 <= len(dropoffs) <= 5):
+        return error_response("validation_failed", "Invalid request.", 400,
+                              {"dropoffs": "1 to 5 drop-offs required"})
+
+    pickup = body.get("pickup") or quote["pickup"]
+    if not _valid_point(pickup):
+        return error_response("validation_failed", "Invalid request.", 400,
+                              {"pickup": "numeric lat/lng required"})
+    for i, d in enumerate(dropoffs):
+        if not _valid_point(d):
+            return error_response("validation_failed", "Invalid request.", 400,
+                                  {f"dropoffs[{i}]": "numeric lat/lng required"})
+        contact = d.get("contact") or {}
+        if not contact.get("name") or not contact.get("phone_number"):
+            return error_response("validation_failed", "Invalid request.", 400,
+                                  {f"dropoffs[{i}].contact": "name and phone_number required"})
+
+    breakdown = quote["breakdown"]
+    charge_total = breakdown["chargeTotal"]
+    is_test = environment == "test"
+    batch_id = uuid.uuid4().hex if len(dropoffs) > 1 else None
+
+    # split the price across stops; reconcile the remainder on the last stop
+    n = len(dropoffs)
+    per_stop = round(charge_total / n, 2)
+    stop_prices = [per_stop] * n
+    stop_prices[-1] = round(charge_total - per_stop * (n - 1), 2)
+
+    # payment (Charan's wallet): charge the prepaid wallet, or fail cleanly if short
+    payment_method = (body.get("payment") or {}).get("method", "wallet")
+    paid = False
+    if payment_method == "wallet":
+        if not wallet.debit(owner, breakdown["amount_cents"]):
+            available = round(wallet.get_balance(owner) / 100, 2)
+            return error_response(
+                "insufficient_funds",
+                "Wallet balance is too low for this booking.", 402,
+                {"required": charge_total, "available": available, "currency": "CAD",
+                 "topup_url": "/v1/wallet/topup"})
+        paid = True
+
+    status = "pending" if paid else "pending_payment"  # paid -> awaiting dispatch
+    pay_status = "paid" if paid else "unpaid"
+
+    created = []
+    for index, d in enumerate(dropoffs):
+        errand_id = str(uuid.uuid4())
+        doc = {
+            "errand_id": errand_id,
+            "business_owner_id": owner,
+            "environment": environment,
+            "test_mode": is_test,
+            "status": status,
+            "reference": d.get("reference") or body.get("reference"),
+            "batch_id": batch_id,
+            "batch_index": index if batch_id else None,
+            "pickup": pickup,
+            "dropoff": d,
+            "vehicle_type": body.get("vehicle_type") or breakdown["recommendedVehicle"],
+            "scheduled_at": body.get("scheduled_at"),
+            "delivery_code": _delivery_code(),
+            "price": stop_prices[index],
+            "pricing": breakdown,
+            "payment": {"status": pay_status, "method": payment_method},
+            "driver": None,
+            "timeline": [{"status": status, "at": _now().isoformat()}],
+            "metadata": body.get("metadata") or {},
+            "created_at": _now(),
+        }
+        db.errands().insert_one(doc)
+        created.append(doc)
+
+    # webhook events (Charan/team): capture + sign lifecycle events
+    webhooks.record_event(owner, "errand.created", created[0])
+    if paid:
+        webhooks.record_event(owner, "errand.paid", created[0])
+
+    resp = _batch_response(created, breakdown, batch_id) if batch_id else _errand_response(created[0])
+    if idem_key:
+        idempotency.save(owner, idem_key, idem_fp, resp)
+    return Response(resp, status=201)
+
+
+# --------------------------------------------------------------------------- #
+# GET /v1/errands/{id}
+# --------------------------------------------------------------------------- #
+@api_view(["GET"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def get_errand(request, errand_id):
+    require_scope(request, "read")
+    owner = request.user.business_owner_id
+    # tenant isolation: scope every lookup to the owning business
+    doc = db.errands().find_one({"errand_id": errand_id, "business_owner_id": owner})
+    if not doc:
+        return error_response("errand_not_found", "Errand not found.", 404)
+    return Response(_errand_response(doc))
+
+
+# --------------------------------------------------------------------------- #
+# response shapers
+# --------------------------------------------------------------------------- #
+def _errand_response(doc):
+    b = doc["pricing"]
+    return {
+        "errand_id": doc["errand_id"],
+        "status": doc["status"],
+        "test_mode": doc["test_mode"],
+        "reference": doc.get("reference"),
+        "batch_id": doc.get("batch_id"),
+        "delivery_code": doc["delivery_code"],
+        "vehicle_type": doc["vehicle_type"],
+        "scheduled_at": doc.get("scheduled_at"),
+        "pickup": doc["pickup"],
+        "dropoff": doc["dropoff"],
+        "pricing": {
+            "currency": b["currency"],
+            "route_price": b["routePrice"],
+            "hst": b["hst"],
+            "charge_total": b["chargeTotal"],
+            "price_for_this_stop": doc["price"],
+        },
+        "payment": doc["payment"],
+        "metadata": doc.get("metadata", {}),
+        "created_at": doc["created_at"].isoformat(),
+    }
+
+
+def _batch_response(docs, breakdown, batch_id):
+    return {
+        "batch_id": batch_id,
+        "status": docs[0]["status"],
+        "stop_count": len(docs),
+        "test_mode": docs[0]["test_mode"],
+        "created_at": docs[0]["created_at"].isoformat(),
+        "pricing": {
+            "currency": breakdown["currency"],
+            "route_price": breakdown["routePrice"],
+            "hst": breakdown["hst"],
+            "charge_total": breakdown["chargeTotal"],
+        },
+        "stops": [
+            {
+                "errand_id": d["errand_id"],
+                "index": d["batch_index"],
+                "reference": d.get("reference"),
+                "status": d["status"],
+                "price": d["price"],
+                "delivery_code": d["delivery_code"],
+            }
+            for d in docs
+        ],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Developer dashboard (web UI) + helpers it needs
+# --------------------------------------------------------------------------- #
+def dashboard(request):
+    """Serve the developer dashboard page."""
+    return render(request, "dashboard.html")
+
+
+def _issue_key(business, scopes=("create", "read", "cancel")):
+    """Create a test key for a business, seed its wallet, and audit it."""
+    owner_id = str(uuid.uuid5(_KEY_NS, business.lower()))
+    plaintext = keys.generate_key("test")
+    db.api_keys().insert_one({
+        "id": str(uuid.uuid4()), "business_owner_id": owner_id, "business_name": business,
+        "name": "dashboard", "environment": "test",
+        "key_prefix": keys.prefix_of(plaintext), "key_hash": keys.hash_key(plaintext),
+        "scopes": list(scopes), "status": "active", "expires_at": None,
+        "created_at": _now(), "last_used_at": None,
+    })
+    # give a new business some test wallet funds so bookings can pay
+    if wallet.get_balance(owner_id) == 0:
+        wallet.topup(owner_id, STARTING_WALLET_CENTS)
+    audit.log("key.created", business=business, key_prefix=keys.prefix_of(plaintext))
+    return plaintext, owner_id
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def create_test_key(request):
+    """Dashboard key creation — TEST keys only (live keys are issued by command)."""
+    business = ((request.data or {}).get("business") or "Demo Business").strip()
+    plaintext, _ = _issue_key(business)
+    return Response({"key": plaintext, "prefix": keys.prefix_of(plaintext),
+                     "business": business, "environment": "test",
+                     "scopes": ["create", "read", "cancel"]}, status=201)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def rotate_test_key(request):
+    """Rotate a key: issue a new one for the same business and revoke the old one."""
+    prefix = (request.data or {}).get("prefix")
+    old = db.api_keys().find_one({"key_prefix": prefix})
+    if not old:
+        return error_response("errand_not_found", "No key with that prefix.", 404)
+    db.api_keys().update_one({"key_prefix": prefix},
+                             {"$set": {"status": "revoked", "revoked_at": _now()}})
+    audit.log("key.rotated", business=old.get("business_name"), key_prefix=prefix,
+              detail="old key revoked, new key issued")
+    plaintext, _ = _issue_key(old.get("business_name", "Demo Business"))
+    return Response({"key": plaintext, "prefix": keys.prefix_of(plaintext),
+                     "business": old.get("business_name"), "rotated_from": prefix}, status=201)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def revoke_test_key(request):
+    """Revoke a key from the dashboard (demo). Revocation is immediate and irreversible."""
+    prefix = (request.data or {}).get("prefix")
+    if not prefix:
+        return error_response("validation_failed", "prefix is required", 400)
+    result = db.api_keys().update_one(
+        {"key_prefix": prefix, "status": {"$ne": "revoked"}},
+        {"$set": {"status": "revoked", "revoked_at": _now()}},
+    )
+    if result.matched_count == 0:
+        return error_response("errand_not_found", "No active key with that prefix.", 404)
+    key = db.api_keys().find_one({"key_prefix": prefix})
+    audit.log("key.revoked", business=key.get("business_name") if key else None, key_prefix=prefix)
+    return Response({"status": "revoked", "prefix": prefix})
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def audit_log(request):
+    """Recent key actions — created / rotated / revoked (supports secure API access)."""
+    return Response({"audit": audit.recent(20)})
+
+
+# --------------------------------------------------------------------------- #
+# Wallet (Charan)
+# --------------------------------------------------------------------------- #
+@api_view(["GET"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def wallet_balance(request):
+    require_scope(request, "read")
+    owner = request.user.business_owner_id
+    balance_cents = wallet.get_balance(owner)
+    return Response({
+        "currency": "CAD",
+        "balance": round(balance_cents / 100, 2),
+        "low_balance": statements.is_low(balance_cents),
+        "email": wallet.get_email(owner),
+        "transactions": wallet.transactions(owner, 25),
+    })
+
+
+@api_view(["POST"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def wallet_set_email(request):
+    """Save the email address that top-up confirmations and low-balance alerts go to."""
+    owner = request.user.business_owner_id
+    email = ((request.data or {}).get("email") or "").strip()
+    if email and "@" not in email:
+        return error_response("validation_failed", "Invalid email.", 400,
+                              {"email": "must be a valid email address"})
+    wallet.set_email(owner, email)
+    return Response({"email": wallet.get_email(owner)})
+
+
+def _topup_page(inner):
+    return ("<!doctype html><html><body style='font-family:Arial,Helvetica,sans-serif;"
+            "text-align:center;padding:60px 20px;color:#1a1a1a'>" + inner +
+            "<p style='color:#888;margin-top:26px'>You can close this tab.</p></body></html>")
+
+
+def confirm_topup(request):
+    """One-click top-up from a wallet email. The link is HMAC-signed, so a click can
+    only top up the business's own wallet and can't be forged or altered."""
+    from django.http import HttpResponse
+    owner = request.GET.get("owner", "")
+    answer = request.GET.get("answer", "")
+    try:
+        amount_cents = int(request.GET.get("amount", ""))
+    except (TypeError, ValueError):
+        return HttpResponse(_topup_page("<h2>Invalid link.</h2>"), status=400)
+    if not wallet.verify_topup_token(owner, amount_cents, request.GET.get("token", "")):
+        return HttpResponse(_topup_page("<h2>This link is invalid or was tampered with.</h2>"),
+                            status=400)
+    if answer == "yes":
+        new_cents = wallet.topup(owner, amount_cents, note="Top-up (from email)")
+        inner = ("<h2 style='color:#5b2fd6'>&#9989; Wallet topped up</h2>"
+                 f"<p>Added ${amount_cents / 100:.2f}. New balance: "
+                 f"<b>${new_cents / 100:.2f}</b>.</p>")
+    else:
+        inner = "<h2>No changes made</h2><p>Your wallet was not topped up.</p>"
+    return HttpResponse(_topup_page(inner))
+
+
+@api_view(["POST"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def wallet_topup(request):
+    owner = request.user.business_owner_id
+    raw = (request.data or {}).get("amount", 50)
+    try:
+        amount = float(raw)
+    except (TypeError, ValueError):
+        return error_response("validation_failed", "Invalid amount.", 400, {"amount": "must be a number"})
+    if amount <= 0 or amount > 100000:
+        return error_response("validation_failed", "Invalid amount.", 400,
+                              {"amount": "must be between 0 and 100000"})
+    cents = int(round(amount * 100))
+    new_balance = wallet.topup(owner, cents)
+    wallet.send_topup_email(owner, cents, new_balance)  # confirmation email
+    return Response({"currency": "CAD", "balance": round(new_balance / 100, 2)})
+
+
+# --------------------------------------------------------------------------- #
+# Tracking, cancel, and a test-mode "advance" (Sai)
+# --------------------------------------------------------------------------- #
+def _owned(owner, errand_id):
+    return db.errands().find_one({"errand_id": errand_id, "business_owner_id": owner})
+
+
+@api_view(["GET"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def track_errand(request, errand_id):
+    require_scope(request, "read")
+    doc = _owned(request.user.business_owner_id, errand_id)
+    if not doc:
+        return error_response("errand_not_found", "Errand not found.", 404)
+    driver = doc.get("driver")
+    eta_min = None
+    eta_at = None
+    distance_remaining_km = None
+    if driver and doc["status"] not in ("delivered", "cancelled"):
+        eta_min = eta.estimate_minutes(driver, doc["dropoff"])
+        eta_at = (_now() + timedelta(minutes=eta_min)).isoformat()
+        distance_remaining_km = round(pricing.haversine_km(driver, doc["dropoff"]) * 1.3, 2)
+    # Preview whether the business can still cancel and what the fee / refund would be.
+    allowed = lifecycle.can_cancel(doc["status"])
+    base_fee = lifecycle.cancellation_fee_cents(doc["status"], doc["pricing"]["amount_cents"]) if allowed else 0
+    grace_left = lifecycle.accept_grace_remaining(doc.get("timeline", []), _now()) if allowed else 0
+    # Grace window after accept keeps cancellation free.
+    fee_cents = 0 if grace_left > 0 else base_fee
+    paid_cents = doc["pricing"]["amount_cents"] if doc.get("payment", {}).get("status") == "paid" else 0
+    refund_cents = max(0, paid_cents - fee_cents) if allowed else 0
+    return Response({
+        "errand_id": doc["errand_id"],
+        "status": doc["status"],
+        "driver": driver,
+        "eta_minutes": eta_min,
+        "eta_at": eta_at,
+        "pickup": {"lat": float(doc["pickup"]["lat"]), "lng": float(doc["pickup"]["lng"])},
+        "dropoff": {"lat": float(doc["dropoff"]["lat"]), "lng": float(doc["dropoff"]["lng"])},
+        "timeline": doc.get("timeline", []),
+        "delivery_code": doc["delivery_code"],
+        "proof_of_delivery": doc.get("proof_of_delivery"),
+        "cancellation": {
+            "allowed": allowed,
+            "fee_cents": fee_cents,
+            "refund_cents": refund_cents,
+            "grace_seconds_remaining": grace_left,
+        },
+        "distance_remaining_km": distance_remaining_km,
+        "cancellation_result": doc.get("cancellation") if doc["status"] == "cancelled" else None,
+    })
+
+
+_CANCEL_BLOCK_MESSAGES = {
+    "picked_up": "Can't cancel — the driver has already picked up the parcel.",
+    "in_transit": "Can't cancel — the driver is on the way to the drop-off.",
+    "arrived_dropoff": "Can't cancel — the driver has arrived at the drop-off.",
+    "delivered": "This delivery is already delivered, so it can't be cancelled.",
+    "cancelled": "This delivery is already cancelled.",
+}
+
+
+def _cancel_one(owner, doc, reason):
+    """Perform the fee/refund/webhook work for a single errand and return a result dict."""
+    from_stage = doc["status"]
+    base_fee = lifecycle.cancellation_fee_cents(from_stage, doc["pricing"]["amount_cents"])
+    grace_left = lifecycle.accept_grace_remaining(doc.get("timeline", []), _now())
+    fee_cents = 0 if grace_left > 0 else base_fee
+    refund_cents = 0
+    if doc["payment"]["status"] == "paid":
+        refund_cents = max(0, doc["pricing"]["amount_cents"] - fee_cents)
+        wallet.refund(owner, refund_cents, doc["errand_id"])
+    db.errands().update_one({"errand_id": doc["errand_id"]}, {"$set": {
+        "status": "cancelled",
+        "cancellation": {"fee": round(fee_cents / 100, 2), "refund": round(refund_cents / 100, 2),
+                         "from_stage": from_stage, "reason": reason},
+    }})
+    doc["status"] = "cancelled"
+    webhooks.record_event(owner, "errand.cancelled", doc, extra={
+        "reason": reason,
+        "fee": round(fee_cents / 100, 2),
+        "refund": round(refund_cents / 100, 2),
+        "from_stage": from_stage,
+    })
+    return {
+        "errand_id": doc["errand_id"],
+        "fee": round(fee_cents / 100, 2),
+        "refund": round(refund_cents / 100, 2),
+        "from_stage": from_stage,
+        "reason": reason,
+    }
+
+
+@api_view(["POST"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def cancel_errand(request, errand_id):
+    """Cancel one errand, or (for multi-stop batches) all non-terminal siblings.
+
+    Multi-stop semantics (TRD FR-CANCEL-02):
+      - If the errand belongs to a batch (multi-stop booking) the call operates on
+        every sibling in the batch.
+      - All-or-nothing by default: if any stop can't be cancelled, the whole call
+        is refused with 409 and per-stop reasons; nothing is cancelled.
+      - Pass ``partial: true`` in the body to cancel only the eligible stops and
+        receive the rest under ``skipped``.
+    """
+    require_scope(request, "cancel")
+    owner = request.user.business_owner_id
+    body = request.data or {}
+
+    # Idempotency: a flaky client that retries this request must not re-emit
+    # errand.cancelled or double-refund. If we've already handled this key, replay.
+    idem_key = request.META.get("HTTP_IDEMPOTENCY_KEY")
+    idem_fp = idempotency.fingerprint({"errand_id": errand_id, "body": body}) if idem_key else None
+    if idem_key:
+        existing = idempotency.lookup(owner, idem_key)
+        if existing:
+            if existing["fingerprint"] == idem_fp:
+                return Response(existing["response"], status=200,
+                                headers={"Idempotent-Replayed": "true"})
+            return error_response("idempotency_key_reused",
+                                  "This Idempotency-Key was already used with a different request.", 422)
+
+    doc = _owned(owner, errand_id)
+    if not doc:
+        return error_response("errand_not_found", "Errand not found.", 404)
+
+    raw_reason = (body.get("reason") or "business_request")
+    reason = str(raw_reason).strip()[:60] or "business_request"
+
+    # Gather the set of stops to operate on — just this errand, or the whole batch.
+    batch_id = doc.get("batch_id")
+    if batch_id:
+        docs = list(db.errands().find({"business_owner_id": owner, "batch_id": batch_id}))
+    else:
+        docs = [doc]
+
+    # Partition into eligible (can cancel now) and skipped (cannot).
+    eligible, skipped = [], []
+    for d in docs:
+        if lifecycle.can_cancel(d["status"]):
+            eligible.append(d)
+        else:
+            skipped.append({
+                "errand_id": d["errand_id"], "status": d["status"],
+                "reason": _CANCEL_BLOCK_MESSAGES.get(d["status"], "Can't cancel at this stage."),
+            })
+
+    partial = bool(body.get("partial"))
+    if skipped and not partial:
+        # All-or-nothing: nothing has been cancelled, bail with a detailed 409.
+        # Single-stop case preserves the legacy one-line error shape for backwards compat.
+        if not batch_id:
+            return error_response("cancellation_not_allowed", skipped[0]["reason"], 409)
+        return error_response("cancellation_not_allowed",
+                              "One or more stops cannot be cancelled. Pass partial=true to cancel the rest.",
+                              409, {"stops": skipped})
+
+    if not eligible:
+        # partial=true but every stop is already terminal; nothing to do.
+        return error_response("cancellation_not_allowed",
+                              "No stops in this booking are still cancellable.", 409,
+                              {"stops": skipped})
+
+    cancelled = [_cancel_one(owner, d, reason) for d in eligible]
+
+    if batch_id:
+        totals = {
+            "fee": round(sum(c["fee"] for c in cancelled), 2),
+            "refund": round(sum(c["refund"] for c in cancelled), 2),
+        }
+        resp = {"status": "cancelled", "batch_id": batch_id, "reason": reason,
+                "cancelled": cancelled, "skipped": skipped, "totals": totals}
+    else:
+        c = cancelled[0]
+        resp = {"status": "cancelled", "fee": c["fee"], "refund": c["refund"],
+                "from_stage": c["from_stage"], "reason": c["reason"]}
+    if idem_key:
+        idempotency.save(owner, idem_key, idem_fp, resp)
+    return Response(resp)
+
+
+# --------------------------------------------------------------------------- #
+# Webhooks (team) — register endpoints + read the signed event feed
+# --------------------------------------------------------------------------- #
+@api_view(["GET", "POST"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def webhooks_collection(request):
+    require_scope(request, "read")
+    owner = request.user.business_owner_id
+    if request.method == "POST":
+        body = request.data or {}
+        url = body.get("url")
+        if not url or not url.startswith("https://"):
+            return error_response("validation_failed", "Invalid request.", 400,
+                                  {"url": "an https:// url is required"})
+        return Response(webhooks.register(owner, url, body.get("events")), status=201)
+    return Response({"endpoints": webhooks.list_endpoints(owner),
+                     "event_catalog": webhooks.EVENT_CATALOG})
+
+
+@api_view(["GET"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def events_list(request):
+    require_scope(request, "read")
+    return Response({"events": webhooks.recent_events(request.user.business_owner_id, 25)})
+
+
+@api_view(["POST"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def advance_errand(request, errand_id):
+    """Test-mode helper: move a test errand one step forward through its lifecycle,
+    simulating the driver so tracking and webhooks can be exercised without a real driver."""
+    require_scope(request, "create")
+    owner = request.user.business_owner_id
+    doc = _owned(owner, errand_id)
+    if not doc:
+        return error_response("errand_not_found", "Errand not found.", 404)
+    order = lifecycle.ORDER
+    cur = doc["status"]
+    if cur == "cancelled":
+        return error_response("validation_failed", "This delivery was cancelled.", 400)
+    if cur == order[-1]:
+        return error_response("validation_failed", "This delivery is already delivered.", 400)
+    if cur not in order:
+        return error_response("validation_failed", f"Unknown status '{cur}'.", 400)
+    nxt = order[order.index(cur) + 1]
+    update = {"status": nxt}
+    # simulate the driver moving from pickup toward the drop-off
+    frac = STAGE_PROGRESS.get(nxt)
+    if frac is not None:
+        pos = progress.position_at(doc["pickup"], doc["dropoff"], frac)
+        driver = doc.get("driver") or {
+            "name": "Sam O.", "phone": "+1 519 555 0101", "vehicle": doc["vehicle_type"],
+            "plate": "CXYZ 123", "rating": 4.9}
+        update["driver"] = {**driver, "lat": pos["lat"], "lng": pos["lng"]}
+    db.errands().update_one({"errand_id": errand_id}, {
+        "$set": update,
+        "$push": {"timeline": {"status": nxt, "at": _now().isoformat()}},
+    })
+    doc["status"] = nxt
+    webhooks.record_event(owner, f"errand.{nxt}", doc)
+    return Response({"errand_id": errand_id, "status": nxt})
+
+
+def _list_errands(request):
+    require_scope(request, "read")
+    owner = request.user.business_owner_id
+    docs = list(db.errands().find({"business_owner_id": owner}).sort("created_at", -1).limit(20))
+    return Response({"errands": [_errand_response(d) for d in docs]})
+
+
+# --------------------------------------------------------------------------- #
+# Live-operations feed (Sai) — GET /v1/livefeed
+# --------------------------------------------------------------------------- #
+@api_view(["GET"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def live_feed(request):
+    """Active deliveries for this business — in-progress only, with progress_percent.
+
+    What a partner's 'live operations' board polls for a quick-glance status. Finished
+    deliveries (delivered / cancelled) drop off; a Deliveries page / history view handles
+    those.
+    """
+    require_scope(request, "read")
+    owner = request.user.business_owner_id
+    rows = livefeed.active(owner)
+    return Response({"active": rows, "count": len(rows)})
+
+
+# --------------------------------------------------------------------------- #
+# Proof of delivery (Sai) — POST /v1/errands/{id}/proof
+# --------------------------------------------------------------------------- #
+@api_view(["POST"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def errand_proof(request, errand_id):
+    """Confirm a delivery at the drop-off with the delivery code + recipient name."""
+    require_scope(request, "create")
+    owner = request.user.business_owner_id
+    doc = _owned(owner, errand_id)
+    if not doc:
+        return error_response("errand_not_found", "Errand not found.", 404)
+    if doc["status"] not in ("arrived_dropoff", "delivered"):
+        return error_response("proof_not_allowed",
+                              "Proof can only be captured once the driver has reached the drop-off.",
+                              409)
+    body = request.data or {}
+    recipient = (body.get("recipient_name") or "").strip()
+    if not recipient:
+        return error_response("validation_failed", "Invalid request.", 400,
+                              {"recipient_name": "recipient_name is required"})
+    if not proof.verify_code(doc["delivery_code"], body.get("delivery_code")):
+        return error_response("delivery_code_mismatch",
+                              "The delivery code does not match this delivery.", 422)
+
+    record = proof.build_record(recipient, body.get("note", ""), code_verified=True)
+    update = {"proof_of_delivery": record}
+    newly_delivered = doc["status"] != "delivered"
+    if newly_delivered:
+        update["status"] = "delivered"
+    db.errands().update_one({"errand_id": errand_id}, {
+        "$set": update,
+        "$push": {"timeline": {"status": "delivered", "at": _now().isoformat()}},
+    })
+    if newly_delivered:
+        doc["status"] = "delivered"
+        webhooks.record_event(owner, "errand.delivered", doc)
+    return Response({"errand_id": errand_id, "status": "delivered",
+                     "proof_of_delivery": record})
+
+
+# --------------------------------------------------------------------------- #
+# Saved address book (Sujith) — GET/POST /v1/addresses
+# --------------------------------------------------------------------------- #
+@api_view(["GET", "POST"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def addresses_collection(request):
+    owner = request.user.business_owner_id
+    if request.method == "POST":
+        require_scope(request, "create")
+        body = request.data or {}
+        saved = addresses.save(owner, body.get("label", ""), body.get("address", ""))
+        if not saved:
+            return error_response("address_not_found",
+                                  "Couldn't find that address near Windsor.", 422)
+        return Response(saved, status=201)
+    require_scope(request, "read")
+    return Response({"addresses": addresses.list_for(owner)})
+
+
+# --------------------------------------------------------------------------- #
+# Wallet statement export (Charan) — GET /v1/wallet/statement.csv
+# --------------------------------------------------------------------------- #
+@api_view(["GET"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def wallet_statement_csv(request):
+    require_scope(request, "read")
+    owner = request.user.business_owner_id
+    csv_text = statements.to_csv(wallet.transactions(owner, 200))
+    resp = HttpResponse(csv_text, content_type="text/csv")
+    resp["Content-Disposition"] = 'attachment; filename="wallet-statement.csv"'
+    return resp
+
+
+# --------------------------------------------------------------------------- #
+# Webhook delivery log (Lucky/team) — GET /v1/webhooks/deliveries
+# --------------------------------------------------------------------------- #
+@api_view(["GET"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def webhook_deliveries(request):
+    require_scope(request, "read")
+    return Response({"deliveries": webhooks.recent_deliveries(request.user.business_owner_id, 25)})
+
+
+# --------------------------------------------------------------------------- #
+# Business reporting (team) — GET /v1/reports/summary
+# --------------------------------------------------------------------------- #
+@api_view(["GET"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
+def reports_summary(request):
+    require_scope(request, "read")
+    return Response(reports.summary(request.user.business_owner_id))
