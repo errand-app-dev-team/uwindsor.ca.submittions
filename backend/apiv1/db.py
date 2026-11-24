@@ -1,0 +1,61 @@
+"""MongoDB access for the API's domain data (keys, quotes, errands).
+
+Everything goes through get_db() so tests can swap in an in-memory database.
+
+To run the app without installing MongoDB (e.g. a teammate trying it locally),
+set the environment variable INMEMORY_DB=1 — it uses an in-memory database
+instead. Data then lives only while the server is running.
+"""
+import os
+
+from django.conf import settings
+
+_client = None
+_db_override = None
+
+
+def set_db_for_tests(db):
+    """Point the whole app at an in-memory (mongomock) database during tests."""
+    global _db_override
+    _db_override = db
+
+
+def get_db():
+    global _client, _db_override
+    if _db_override is not None:
+        return _db_override
+    if os.environ.get("PERSIST_DB") == "1":
+        # File-backed mode (Nikhil): in-memory database, but loaded from and saved to
+        # disk so a company's login, deliveries, wallet and events survive a restart.
+        import mongomock
+
+        from . import persistence
+
+        _db_override = mongomock.MongoClient()["aerrand"]
+        persistence.load_into(_db_override)
+        return _db_override
+    if os.environ.get("INMEMORY_DB") == "1":
+        import mongomock
+
+        _db_override = mongomock.MongoClient()["aerrand"]
+        return _db_override
+    if _client is None:
+        import pymongo
+
+        _client = pymongo.MongoClient(settings.MONGO_URL)
+    # database name comes from the connection string (…/aerrand)
+    return _client.get_default_database()
+
+
+# Collection accessors -------------------------------------------------------
+
+def api_keys():
+    return get_db()["api_keys"]
+
+
+def quotes():
+    return get_db()["quotes"]
+
+
+def errands():
+    return get_db()["errands"]

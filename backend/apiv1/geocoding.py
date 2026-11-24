@@ -1,0 +1,76 @@
+"""Turn a typed address or place name into coordinates (geocoding).
+
+Known Windsor places resolve instantly from a small built-in table (works offline,
+no network). Anything else is looked up through OpenStreetMap's free Nominatim
+service, biased to the Windsor area. Returns None when it can't be resolved.
+"""
+import json
+import urllib.parse
+import urllib.request
+
+# Known places resolve immediately, no network call needed.
+PRESETS = {
+    "downtown windsor": (42.3149, -83.0364),
+    "university of windsor": (42.3060, -83.0665),
+    "devonshire mall": (42.2606, -82.9962),
+    "windsor airport": (42.2756, -82.9556),
+    "st clair college": (42.2342, -83.0699),
+    "riverside": (42.3300, -82.9400),
+    "tecumseh": (42.3100, -82.8960),
+    "lasalle": (42.2200, -83.0700),
+}
+
+# Bounding box around Windsor (left,top,right,bottom as lng,lat) to bias lookups.
+_VIEWBOX = "-83.15,42.40,-82.85,42.20"
+
+
+def geocode(query):
+    """Return {'lat', 'lng', 'label'} for an address/place, or None if not found."""
+    if not query or not query.strip():
+        return None
+    q = query.strip()
+    key = " ".join(q.lower().replace(".", "").replace(",", " ").split())
+    for name, (lat, lng) in PRESETS.items():
+        if name in key:
+            return {"lat": lat, "lng": lng, "label": q}
+    # fall back to OpenStreetMap Nominatim (free, no API key).
+    #
+    # Ordering matters because many street names (e.g. "Tuscarora") also exist in far
+    # US towns. We decide what to look up first by whether the query has a house number:
+    #   * A NUMBERED street address ("223 Tuscarora St") is a real delivery address, so
+    #     we resolve it in Windsor first — a local shop never types the city every time.
+    #   * A BARE place/city name ("New York", "Toronto") is looked up as typed, so a
+    #     genuinely far city resolves to its real location and lands outside our area.
+    # If a user explicitly names Windsor, we trust that and look it up as typed.
+    has_house_number = any(ch.isdigit() for ch in q)
+    names_windsor = "windsor" in key
+    windsor_ctx = q + ", Windsor, Ontario"
+    if names_windsor:
+        attempts = [q]
+    elif has_house_number:
+        attempts = [windsor_ctx, q]          # numbered address → prefer local
+    else:
+        attempts = [q, windsor_ctx]          # bare place name → resolve as typed
+    for search in attempts:
+        hit = _nominatim(search)
+        if hit:
+            return {**hit, "label": q}
+    return None
+
+
+def _nominatim(q):
+    try:
+        params = urllib.parse.urlencode({
+            "q": q, "format": "json", "limit": "1",
+            "countrycodes": "ca,us",   # Canada + US, so far cities like New York resolve
+            "viewbox": _VIEWBOX,   # bias toward Windsor (not a hard boundary)
+        })
+        url = "https://nominatim.openstreetmap.org/search?" + params
+        req = urllib.request.Request(url, headers={"User-Agent": "aerrand-dev-portal/1.0"})
+        with urllib.request.urlopen(req, timeout=4) as r:
+            data = json.loads(r.read())
+        if data:
+            return {"lat": float(data[0]["lat"]), "lng": float(data[0]["lon"])}
+    except Exception:
+        return None
+    return None
