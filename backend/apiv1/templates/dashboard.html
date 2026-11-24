@@ -130,6 +130,27 @@
 </style>
 </head>
 <body>
+<!-- Login gate (Nikhil): the whole portal is locked until a company signs in -->
+<div id="loginGate" style="position:fixed;inset:0;z-index:1000;background:#f4f2fb;display:flex;align-items:center;justify-content:center">
+  <div style="width:380px;max-width:92vw;background:#fff;border-radius:16px;box-shadow:0 20px 60px rgba(40,20,90,.18);padding:30px 30px 26px">
+    <div style="font-size:30px;font-weight:800;color:#5202D9;letter-spacing:-.5px">aerrand</div>
+    <p id="gateSub" style="color:#6b6b76;margin:4px 0 18px;font-size:14px">Sign in to your company to manage deliveries.</p>
+    <div style="display:flex;gap:8px;margin-bottom:16px">
+      <button type="button" id="tabSignin" onclick="setMode('signin')" style="padding:7px 16px;border:1px solid #5202D9;border-radius:999px;background:#5202D9;color:#fff;font-weight:600;font-size:13px;cursor:pointer">Sign in</button>
+      <button type="button" id="tabSignup" onclick="setMode('signup')" style="padding:7px 16px;border:1px solid #5202D9;border-radius:999px;background:#fff;color:#5202D9;font-weight:600;font-size:13px;cursor:pointer">Sign up</button>
+    </div>
+    <label style="font-size:11px;font-weight:700;color:#8a8a93;letter-spacing:.4px">COMPANY NAME</label>
+    <input id="gateCompany" type="text" autocomplete="off" style="width:100%;box-sizing:border-box;margin:5px 0 12px;padding:11px 12px;border:1px solid #e3e1ea;border-radius:9px;font-size:14px" placeholder="e.g. Acme Co">
+    <div id="gateEmailWrap" style="display:none">
+      <label style="font-size:11px;font-weight:700;color:#8a8a93;letter-spacing:.4px">COMPANY EMAIL</label>
+      <input id="gateEmail" type="email" autocomplete="off" style="width:100%;box-sizing:border-box;margin:5px 0 12px;padding:11px 12px;border:1px solid #e3e1ea;border-radius:9px;font-size:14px" placeholder="e.g. ops@acme.co">
+    </div>
+    <label style="font-size:11px;font-weight:700;color:#8a8a93;letter-spacing:.4px">PASSWORD</label>
+    <input id="gatePassword" type="password" style="width:100%;box-sizing:border-box;margin:5px 0 4px;padding:11px 12px;border:1px solid #e3e1ea;border-radius:9px;font-size:14px" placeholder="••••••••" onkeydown="if(event.key==='Enter')doAuth()">
+    <div id="gateMsg" style="color:#c0392b;font-size:12.5px;min-height:16px;margin:6px 0"></div>
+    <button type="button" id="gateBtn" onclick="doAuth()" style="width:100%;padding:12px;border:none;border-radius:10px;background:#5202D9;color:#fff;font-weight:700;font-size:15px;cursor:pointer">Sign in</button>
+  </div>
+</div>
 <div class="app">
   <aside class="sidebar">
     <div class="logo">aerrand</div>
@@ -151,6 +172,7 @@
         <span class="chip" id="walletChip">Wallet —</span>
         <span class="chip off" id="keyChip">Not connected</span>
         <span class="chip env">● Sandbox</span>
+        <button class="copy" id="signOutBtn" onclick="signOut()" style="display:none">Sign out</button>
       </div>
     </div>
 
@@ -176,12 +198,14 @@
         <div class="card"><h3>1 · API key &amp; wallet</h3><p class="d">A business gets a key (stored only as a hash) and a prepaid wallet. Rotate or revoke instantly — every action is audit-logged.</p>
           <label>Business name</label><input id="business" value="Acme Co">
           <button id="btnKey" onclick="genKey()">Generate test key</button>
-          <div class="result" id="keyOut"></div></div>
+          <div class="result" id="keyOut"></div>
+          <button class="ghost sm" style="margin-top:10px" onclick="loadAudit()">🔎 View audit log</button>
+          <div class="result" id="auditOut"></div></div>
         <div class="card"><h3>Saved addresses</h3><p class="d">Save places you use often (a warehouse, a store). We look up the coordinates once, and you can pick them by name for pickup or drop-off below.</p>
           <label>Label</label><input id="addrLabel" placeholder="e.g. Warehouse">
           <label>Address</label><input id="addrQuery" placeholder="e.g. 401 Sunset Ave, Windsor, ON">
           <button id="btnAddr" onclick="saveAddress()" disabled>Save address</button>
-          <div id="addrMsg" class="note">Generate a test key first.</div>
+          <div id="addrMsg" class="note">Sign in to manage saved addresses.</div>
           <div id="addrList"></div></div>
         <div class="card"><h3>2 · Price a route</h3><p class="d">The server computes the price from distance, stops, parcel sizes and tax. The caller can never send a price.</p>
           <label>Pickup location</label>
@@ -244,19 +268,34 @@
       <!-- WALLET -->
       <section class="page" id="p-wallet">
         <div class="cards" style="grid-template-columns:repeat(3,1fr)">
-          <div class="metric"><div class="l">Balance</div><div class="v" id="wBig" style="color:var(--violet);font-size:30px">—</div></div>
+          <div class="metric"><div class="l">Balance</div><div class="v" id="wBig" style="color:var(--violet);font-size:30px">—</div><div id="wLow" style="display:none;color:var(--err,#c0392b);font-size:12px;font-weight:600;margin-top:4px">⚠ Low balance — top up</div></div>
           <div class="metric"><div class="l">Total added</div><div class="v pos" id="wAdded">—</div></div>
           <div class="metric"><div class="l">Total spent</div><div class="v neg" id="wSpent">—</div></div>
         </div>
         <div class="card"><h3>Top up the wallet</h3>
-          <p class="d">Bookings charge this balance; cancellations refund to it.</p>
+          <p class="d">Bookings charge this balance; cancellations refund to it. Every top-up emails a confirmation to your alert address.</p>
           <div class="row3" style="max-width:380px">
             <button class="ghost sm" onclick="topup(25)">+ $25</button>
             <button class="ghost sm" onclick="topup(50)">+ $50</button>
             <button class="ghost sm" onclick="topup(100)">+ $100</button>
+          </div>
+          <div style="display:flex;gap:8px;max-width:380px;margin-top:10px">
+            <input id="topupCustomAmt" type="number" min="1" step="1" placeholder="Custom amount" style="flex:1">
+            <button class="sm" style="margin:0" onclick="topupCustom()">Add money</button>
           </div></div>
-        <div class="card"><h3>Transaction statement</h3>
-          <table><thead><tr><th>Type</th><th>Note</th><th>When</th><th style="text-align:right">Amount</th></tr></thead>
+        <div class="card"><h3>Wallet alert email</h3>
+          <p class="d">We email this address a <b>confirmation on every top-up</b>, and a one-click top-up link if the balance drops below $20.</p>
+          <div style="display:flex;gap:8px;max-width:420px">
+            <input id="walletEmail" type="email" placeholder="you@company.com" style="flex:1">
+            <button class="sm" style="margin:0" onclick="saveWalletEmail()">Save</button>
+          </div>
+          <div class="result" id="walletEmailOut"></div></div>
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <h3 style="margin:0">Transaction statement</h3>
+            <button class="ghost sm" style="margin:0" onclick="downloadStatement()">⬇ Download CSV</button>
+          </div>
+          <table style="margin-top:10px"><thead><tr><th>Type</th><th>Note</th><th>When</th><th style="text-align:right">Amount</th></tr></thead>
           <tbody id="txnRows"><tr><td colspan="4" class="empty">No transactions yet.</td></tr></tbody></table></div>
       </section>
 
@@ -268,6 +307,9 @@
         <div class="two">
           <div class="card"><h3>Event feed (signed)</h3><p class="d">Live events as deliveries progress.</p>
             <table><thead><tr><th>Event</th><th>Status</th><th>Signature</th></tr></thead><tbody id="evRows"><tr><td colspan="3" class="empty">No events yet.</td></tr></tbody></table></div>
+          <div class="card"><div style="display:flex;justify-content:space-between;align-items:center"><h3 style="margin:0">Delivery log (webhook attempts)</h3><button class="ghost sm" style="margin:0" onclick="loadWebhookDeliveries()">Refresh</button></div>
+            <p class="d">Every signed event we POST to your endpoint, with the HTTP response we got back.</p>
+            <table><thead><tr><th>Event</th><th>Endpoint</th><th style="text-align:right">Response</th></tr></thead><tbody id="whDelivRows"><tr><td colspan="3" class="empty">No delivery attempts yet — register an endpoint above, then progress a delivery.</td></tr></tbody></table></div>
           <div class="card"><h3>Event catalogue</h3>
             <div id="catalog" class="note"></div>
             <h3 style="margin-top:16px">Sample signed payload</h3>
@@ -303,9 +345,10 @@ function nav(p){
   document.querySelectorAll(".nav a").forEach(a=>a.classList.toggle("active",a.dataset.p===p));
   $("pageTitle").textContent=TITLES[p];
   if(p==="overview"){loadErrands();loadEvents();loadActive();}
+  if(p==="create")loadAddresses();
   if(p==="deliveries"){loadErrands();loadActive();}
   if(p==="wallet")loadWallet();
-  if(p==="webhooks")loadEvents();
+  if(p==="webhooks"){loadEvents();loadWebhookDeliveries();}
   if(p==="tracking"){ refreshTrack(); startTrackPolling(); } else { stopGraceCountdown(); stopTrackPolling(); }
 }
 
@@ -315,6 +358,46 @@ async function api(path,method,body,extra){
   if(extra) Object.assign(h,extra);
   const r=await fetch(path,{method,headers:h,body:body?JSON.stringify(body):undefined});
   const d=await r.json().catch(()=>({})); return {ok:r.ok,status:r.status,data:d};
+}
+
+/* company accounts — login gate (Nikhil) */
+let AUTH_MODE="signin";
+function setMode(m){
+  AUTH_MODE=m;
+  const si=$("tabSignin"), su=$("tabSignup");
+  const on="background:#5202D9;color:#fff", off="background:#fff;color:#5202D9";
+  si.style.cssText="padding:7px 16px;border:1px solid #5202D9;border-radius:999px;font-weight:600;font-size:13px;cursor:pointer;"+(m==="signin"?on:off);
+  su.style.cssText="padding:7px 16px;border:1px solid #5202D9;border-radius:999px;font-weight:600;font-size:13px;cursor:pointer;"+(m==="signup"?on:off);
+  $("gateEmailWrap").style.display = m==="signup" ? "block" : "none";
+  $("gateSub").textContent = m==="signup" ? "Create a company account to manage deliveries." : "Sign in to your company to manage deliveries.";
+  $("gateBtn").textContent = m==="signup" ? "Create account" : "Sign in";
+  $("gateMsg").textContent="";
+}
+async function doAuth(){
+  const name=$("gateCompany").value.trim();
+  const pw=$("gatePassword").value;
+  const email=$("gateEmail").value.trim();
+  if(!name||!pw||(AUTH_MODE==="signup"&&!email)){ $("gateMsg").textContent="Please fill in all fields."; return; }
+  $("gateBtn").disabled=true;
+  const r=await api(AUTH_MODE==="signup"?"/v1/auth/signup":"/v1/auth/login","POST",{company:name,email:email,password:pw});
+  $("gateBtn").disabled=false;
+  if(!r.ok){ $("gateMsg").textContent=(r.data&&(r.data.message||(r.data.error&&r.data.error.message)))||"Wrong company name or password."; return; }
+  API_KEY=r.data.key; BUSINESS=r.data.company||name;
+  $("keyChip").textContent="● "+BUSINESS; $("keyChip").className="chip env";
+  const q=$("btnQuote"); if(q) q.disabled=false;
+  const b=$("business"); if(b) b.value=BUSINESS;
+  $("signOutBtn").style.display="";
+  $("loginGate").style.display="none";
+  nav("overview"); loadWallet(); loadAddresses();
+  toast("Signed in as "+BUSINESS);
+}
+function signOut(){
+  API_KEY=null; KEY_PREFIX=null; BUSINESS=""; ERRAND_ID=null;
+  $("keyChip").textContent="Not connected"; $("keyChip").className="chip off";
+  $("walletChip").textContent="Wallet —";
+  $("signOutBtn").style.display="none";
+  $("gatePassword").value="";
+  $("loginGate").style.display="flex";
 }
 
 /* keys (Nikhil) */
@@ -363,6 +446,8 @@ async function loadWallet(){
   const r=await api("/v1/wallet","GET"); if(!r.ok)return;
   $("walletChip").textContent="Wallet "+money(r.data.balance);
   $("mWallet").textContent=money(r.data.balance); $("wBig").textContent=money(r.data.balance);
+  if($("wLow")) $("wLow").style.display = r.data.low_balance ? "block" : "none";
+  if($("walletEmail") && document.activeElement!==$("walletEmail")) $("walletEmail").value = r.data.email || "";
   const tx=r.data.transactions||[];
   let added=0, spent=0;
   tx.forEach(t=>{ if(t.kind==="topup") added+=t.amount; else if(t.kind==="charge") spent+=-t.amount; });
@@ -377,10 +462,54 @@ async function topup(amount){
   amount=amount||50;
   const r=await api("/v1/wallet/topup","POST",{amount});
   if(!r.ok){ toast("Top-up failed ("+((r.data.error&&r.data.error.message)||r.status)+")"); return; }
-  loadWallet(); toast("Topped up "+money(amount));
+  loadWallet(); toast("Topped up "+money(amount)+" · confirmation emailed");
+}
+async function downloadStatement(){
+  if(!API_KEY){ toast("Sign in first"); return; }
+  const r=await fetch("/v1/wallet/statement.csv",{headers:{"Authorization":"Bearer "+API_KEY}});
+  if(!r.ok){ toast("Couldn't export statement"); return; }
+  const blob=await r.blob();
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url; a.download="wallet-statement.csv"; document.body.appendChild(a); a.click();
+  a.remove(); URL.revokeObjectURL(url);
+  toast("Statement downloaded");
+}
+async function topupCustom(){
+  const v=parseFloat($("topupCustomAmt").value);
+  if(!v||v<=0){ toast("Enter an amount"); return; }
+  await topup(v); $("topupCustomAmt").value="";
+}
+async function saveWalletEmail(){
+  if(!API_KEY){ toast("Sign in first"); return; }
+  const email=$("walletEmail").value.trim();
+  const r=await api("/v1/wallet/email","POST",{email});
+  if(!r.ok) return fail($("walletEmailOut"),(r.data.error&&r.data.error.message)||"Error");
+  show($("walletEmailOut"),'<b style="color:var(--violet)">Saved.</b> Top-up confirmations and low-balance alerts will go to '+(r.data.email||"(none)")+'.');
+  toast("Alert email saved");
 }
 
-/* pricing (Sujith) */
+/* audit log (Nikhil) */
+async function loadAudit(){
+  if(!API_KEY){ toast("Sign in first"); return; }
+  const r=await api("/v1/keys/audit","GET");
+  const rows=(r.ok&&r.data.audit)||[];
+  if(!rows.length){ show($("auditOut"),'<span class="note">No key activity yet.</span>'); return; }
+  const html='<table style="margin-top:8px"><thead><tr><th>Action</th><th>Key</th><th>When</th></tr></thead><tbody>'+
+    rows.slice(0,15).map(a=>'<tr><td><span class="badge">'+a.action+'</span></td><td class="mono" style="font-size:11px">'+(a.key_prefix||'—')+'</td><td>'+(a.at||'').slice(5,16).replace("T"," ")+'</td></tr>').join("")+'</tbody></table>';
+  show($("auditOut"),html);
+}
+
+/* webhook delivery log (team) */
+async function loadWebhookDeliveries(){
+  const tb=$("whDelivRows"); if(!tb) return;
+  if(!API_KEY) return;
+  const r=await api("/v1/webhooks/deliveries","GET");
+  const rows=(r.ok&&r.data.deliveries)||[];
+  if(!rows.length){ tb.innerHTML='<tr><td colspan="3" class="empty">No delivery attempts yet — register an endpoint above, then progress a delivery.</td></tr>'; return; }
+  tb.innerHTML=rows.map(d=>'<tr><td>'+(d.event_type||d.type||'event')+'</td><td class="mono" style="font-size:11px">'+(d.url||'—')+'</td><td style="text-align:right"><span class="badge">'+(d.status_code||d.status||'—')+'</span></td></tr>').join("");
+}
+
 /* saved addresses (Sujith) */
 let SAVED_ADDRS=[];
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -413,6 +542,8 @@ async function saveAddress(){
   $("addrLabel").value=""; $("addrQuery").value="";
   SAVED_ADDRS.unshift(r.data); renderAddresses(); toast("Saved "+r.data.label);
 }
+
+/* pricing (Sujith) */
 async function geocodeAddr(q){
   const saved=SAVED_ADDRS.find(a=>a.label.toLowerCase()===String(q).trim().toLowerCase());
   if(saved) return {lat:saved.lat,lng:saved.lng};
