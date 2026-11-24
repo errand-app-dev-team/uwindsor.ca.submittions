@@ -24,6 +24,16 @@ def get_db():
     global _client, _db_override
     if _db_override is not None:
         return _db_override
+    if os.environ.get("PERSIST_DB") == "1":
+        # File-backed mode (Nikhil): in-memory database, but loaded from and saved to
+        # disk so a company's login, deliveries, wallet and events survive a restart.
+        import mongomock
+
+        from . import persistence
+
+        _db_override = mongomock.MongoClient()["aerrand"]
+        persistence.load_into(_db_override)
+        return _db_override
     if os.environ.get("INMEMORY_DB") == "1":
         import mongomock
 

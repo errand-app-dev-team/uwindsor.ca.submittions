@@ -39,3 +39,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# runtime data (hashed passwords, wallets) — never commit
+backend/.aerrand-data.pkl
+*.aerrand-data.pkl

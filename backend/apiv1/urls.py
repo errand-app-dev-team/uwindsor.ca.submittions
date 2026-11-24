@@ -1,10 +1,15 @@
 from django.urls import path
 
 from . import views
+from . import auth_views
 
 urlpatterns = [
     path("health", views.health, name="health"),
     path("service-areas", views.service_areas, name="service-areas"),
+
+    # company accounts — sign up / sign in (Nikhil)
+    path("auth/signup", auth_views.signup, name="auth-signup"),
+    path("auth/login", auth_views.login, name="auth-login"),
 
     # API keys (Nikhil)
     path("keys", views.create_test_key, name="create-test-key"),
@@ -22,6 +27,8 @@ urlpatterns = [
     # wallet (Charan)
     path("wallet", views.wallet_balance, name="wallet"),
     path("wallet/topup", views.wallet_topup, name="wallet-topup"),
+    path("wallet/email", views.wallet_set_email, name="wallet-email"),
+    path("wallet/confirm-topup", views.confirm_topup, name="wallet-confirm-topup"),
     path("wallet/statement.csv", views.wallet_statement_csv, name="wallet-statement"),
 
     # tracking + cancel + proof of delivery + live feed (Sai)

@@ -499,6 +499,7 @@ def wallet_balance(request):
         "currency": "CAD",
         "balance": round(balance_cents / 100, 2),
         "low_balance": statements.is_low(balance_cents),
+        "email": wallet.get_email(owner),
         "transactions": wallet.transactions(owner, 25),
     })
 
@@ -506,11 +507,63 @@ def wallet_balance(request):
 @api_view(["POST"])
 @authentication_classes([ApiKeyAuthentication])
 @permission_classes([IsAuthenticated])
+def wallet_set_email(request):
+    """Save the email address that top-up confirmations and low-balance alerts go to."""
+    owner = request.user.business_owner_id
+    email = ((request.data or {}).get("email") or "").strip()
+    if email and "@" not in email:
+        return error_response("validation_failed", "Invalid email.", 400,
+                              {"email": "must be a valid email address"})
+    wallet.set_email(owner, email)
+    return Response({"email": wallet.get_email(owner)})
+
+
+def _topup_page(inner):
+    return ("<!doctype html><html><body style='font-family:Arial,Helvetica,sans-serif;"
+            "text-align:center;padding:60px 20px;color:#1a1a1a'>" + inner +
+            "<p style='color:#888;margin-top:26px'>You can close this tab.</p></body></html>")
+
+
+def confirm_topup(request):
+    """One-click top-up from a wallet email. The link is HMAC-signed, so a click can
+    only top up the business's own wallet and can't be forged or altered."""
+    from django.http import HttpResponse
+    owner = request.GET.get("owner", "")
+    answer = request.GET.get("answer", "")
+    try:
+        amount_cents = int(request.GET.get("amount", ""))
+    except (TypeError, ValueError):
+        return HttpResponse(_topup_page("<h2>Invalid link.</h2>"), status=400)
+    if not wallet.verify_topup_token(owner, amount_cents, request.GET.get("token", "")):
+        return HttpResponse(_topup_page("<h2>This link is invalid or was tampered with.</h2>"),
+                            status=400)
+    if answer == "yes":
+        new_cents = wallet.topup(owner, amount_cents, note="Top-up (from email)")
+        inner = ("<h2 style='color:#5b2fd6'>&#9989; Wallet topped up</h2>"
+                 f"<p>Added ${amount_cents / 100:.2f}. New balance: "
+                 f"<b>${new_cents / 100:.2f}</b>.</p>")
+    else:
+        inner = "<h2>No changes made</h2><p>Your wallet was not topped up.</p>"
+    return HttpResponse(_topup_page(inner))
+
+
+@api_view(["POST"])
+@authentication_classes([ApiKeyAuthentication])
+@permission_classes([IsAuthenticated])
 def wallet_topup(request):
     owner = request.user.business_owner_id
-    amount = (request.data or {}).get("amount", 50)
-    wallet.topup(owner, int(round(float(amount) * 100)))
-    return Response({"currency": "CAD", "balance": round(wallet.get_balance(owner) / 100, 2)})
+    raw = (request.data or {}).get("amount", 50)
+    try:
+        amount = float(raw)
+    except (TypeError, ValueError):
+        return error_response("validation_failed", "Invalid amount.", 400, {"amount": "must be a number"})
+    if amount <= 0 or amount > 100000:
+        return error_response("validation_failed", "Invalid amount.", 400,
+                              {"amount": "must be between 0 and 100000"})
+    cents = int(round(amount * 100))
+    new_balance = wallet.topup(owner, cents)
+    wallet.send_topup_email(owner, cents, new_balance)  # confirmation email
+    return Response({"currency": "CAD", "balance": round(new_balance / 100, 2)})
 
 
 # --------------------------------------------------------------------------- #

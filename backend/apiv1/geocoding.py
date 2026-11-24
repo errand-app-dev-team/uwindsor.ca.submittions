@@ -34,14 +34,23 @@ def geocode(query):
         if name in key:
             return {"lat": lat, "lng": lng, "label": q}
     # fall back to OpenStreetMap Nominatim (free, no API key).
-    # Look up the address as typed first: the viewbox softly biases ambiguous local
-    # addresses toward Windsor, but a clear far-away place (Toronto, New York) resolves
-    # to its REAL location — so it correctly lands outside our Windsor service area.
-    # Only if that finds nothing do we retry with explicit Windsor context, to help a
-    # bare house/street number resolve.
-    attempts = [q]
-    if "windsor" not in key:
-        attempts.append(q + ", Windsor, Ontario")
+    #
+    # Ordering matters because many street names (e.g. "Tuscarora") also exist in far
+    # US towns. We decide what to look up first by whether the query has a house number:
+    #   * A NUMBERED street address ("223 Tuscarora St") is a real delivery address, so
+    #     we resolve it in Windsor first — a local shop never types the city every time.
+    #   * A BARE place/city name ("New York", "Toronto") is looked up as typed, so a
+    #     genuinely far city resolves to its real location and lands outside our area.
+    # If a user explicitly names Windsor, we trust that and look it up as typed.
+    has_house_number = any(ch.isdigit() for ch in q)
+    names_windsor = "windsor" in key
+    windsor_ctx = q + ", Windsor, Ontario"
+    if names_windsor:
+        attempts = [q]
+    elif has_house_number:
+        attempts = [windsor_ctx, q]          # numbered address → prefer local
+    else:
+        attempts = [q, windsor_ctx]          # bare place name → resolve as typed
     for search in attempts:
         hit = _nominatim(search)
         if hit:
